@@ -1,0 +1,38 @@
+# Keep same style as other recipes (e.g., recipe/dapo/*)
+# Reuse official trainer config via Hydra searchpath.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ---- minimal toggles you likely already tune in your env
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+algorithm:
+  # Use GRPO or your vectorized GRPO estimator per your repo
+  adv_estimator: GRPO   # or: grpo_vectorized (if your build exposes it as string)
+  norm_adv_by_std_in_grpo: true
+
+  # Knapsack budget allocation (recipe-specific; read by KnapsackRayTrainer)
+  budget_alloc:
+    enable: true
+    n_low: 2
+    n_up: 128
+    ema: 0.7
+    prior_alpha: 1.0
+    prior_beta: 1.0
+    override_total_budget: null  # default: M * rollout.n
+    hard_fallback_share: 1.0
+    easy_min_cover: true
+
+trainer:
+  project_name: knapsack-grpo
+  experiment_name: ${now:%Y%m%d}-${now:%H%M%S}
+
+# You can keep all other ppo_trainer defaults (actor/critic/reward)
+# and your usual ray_kwargs / resource pools unchanged.
