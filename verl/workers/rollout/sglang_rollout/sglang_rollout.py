@@ -1274,6 +1274,10 @@ class SGLangRollout(BaseRollout):
             output_logprobs = []
             rollout_output_token_ids = []
 
+        completion_tokens_list = []
+        total_off_policy_tokens = 0
+        partial_samples_count = 0
+
         for req in sorted_output_req_list:
             assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
             assert (
@@ -1316,6 +1320,13 @@ class SGLangRollout(BaseRollout):
                 # extract output log_probs
                 output_logprobs.append(req.rollout_log_probs[-len(req.response_ids) :])
                 rollout_output_token_ids.append(req.output_token_ids[-len(req.response_ids) :])
+
+            if getattr(req, "completion_tokens", None) is not None:
+                completion_tokens_list.append(req.completion_tokens)
+            if req.metadata:
+                total_off_policy_tokens += req.metadata.get("total_off_policy_tokens", 0)
+                if "start_rollout_id" in req.metadata:
+                    partial_samples_count += 1
 
         prompt_ids = pad_sequence(
             prompt_ids,
@@ -1422,9 +1433,30 @@ class SGLangRollout(BaseRollout):
         if is_multimodal:
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
 
+        completion_tokens_stats = {}
+        if completion_tokens_list:
+            arr = np.array(completion_tokens_list)
+            completion_tokens_stats = {
+                "total_completion_tokens": int(np.sum(arr)),
+                "completion_tokens_mean": float(np.mean(arr)),
+                "completion_tokens_std": float(np.std(arr)),
+                "completion_tokens_count": int(len(arr)),
+            }
+
+        meta_info = prompts.meta_info.copy()
+        meta_info.update(
+            {
+                "completion_tokens_stats": completion_tokens_stats,
+                "partial_samples": partial_samples_count if self.config.partial_rollout else 0,
+                "total_off_policy_tokens": total_off_policy_tokens if self.config.partial_rollout else 0,
+                "response_lengths": [int(mask.sum().item()) for mask in response_loss_mask],
+            }
+        )
+
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
+            meta_info=meta_info,
         )
 
     def _create_padding_request(self, original_req: AsyncRolloutRequest) -> AsyncRolloutRequest:
