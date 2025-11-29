@@ -76,8 +76,8 @@ def test_partial_buffer_filter_path_invalid():
     # invalid module/function path should raise
     try:
         PartialBuffer("non.existent:fn")
-    except Exception as e:  # noqa: PIE786
-        assert isinstance(e, (ValueError, ModuleNotFoundError))
+    except Exception as e:
+        assert isinstance(e, (ValueError | ModuleNotFoundError))
     else:
         raise AssertionError("Invalid filter path did not raise")
 
@@ -88,11 +88,11 @@ def test_partial_buffer_filter_not_callable(monkeypatch):
 
     module_name = __name__
     mod = importlib.import_module(module_name)
-    setattr(mod, "not_callable", 123)
+    mod.not_callable = 123
     try:
         try:
             PartialBuffer(f"{module_name}:not_callable")
-        except Exception as e:  # noqa: PIE786
+        except Exception as e:
             assert isinstance(e, TypeError)
         else:
             raise AssertionError("Non-callable filter did not raise TypeError")
