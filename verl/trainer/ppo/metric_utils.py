@@ -221,6 +221,36 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # partial rollout stats from meta_info (if available)
+    meta = batch.meta_info if hasattr(batch, "meta_info") else {}
+    if meta:
+        completion_stats = meta.get("completion_tokens_stats", {}) or {}
+        if completion_stats:
+            metrics["partial_rollout/tokens_total"] = completion_stats.get("total_completion_tokens", 0)
+            metrics["partial_rollout/tokens_mean"] = completion_stats.get("completion_tokens_mean", 0)
+            metrics["partial_rollout/tokens_std"] = completion_stats.get("completion_tokens_std", 0)
+            metrics["partial_rollout/tokens_count"] = completion_stats.get("completion_tokens_count", 0)
+
+        if "partial_samples" in meta:
+            metrics["partial_rollout/partial_samples"] = meta.get("partial_samples", 0)
+        if "total_off_policy_tokens" in meta:
+            total_off = meta.get("total_off_policy_tokens", 0)
+            metrics["partial_rollout/total_off_policy_tokens"] = total_off
+            total_tokens = completion_stats.get("total_completion_tokens", 0)
+            denom = total_tokens + total_off
+            if denom > 0:
+                metrics["partial_rollout/off_policy_ratio"] = total_off / denom
+
+        # optional: response length stats from meta (fallback when present)
+        if "response_lengths" in meta:
+            rl = meta["response_lengths"]
+            if rl:
+                rl_arr = torch.tensor(rl, dtype=torch.float32)
+                metrics["partial_rollout/response_length_mean"] = rl_arr.mean().item()
+                metrics["partial_rollout/response_length_max"] = rl_arr.max().item()
+                metrics["partial_rollout/response_length_min"] = rl_arr.min().item()
+                metrics["partial_rollout/response_length_std"] = rl_arr.std().item()
+
     return metrics
 
 
