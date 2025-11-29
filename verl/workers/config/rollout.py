@@ -173,6 +173,13 @@ class RolloutConfig(BaseConfig):
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 
+    # Partial rollout controls (APRIL-style).
+    partial_rollout: bool = False
+    # Oversampling batch size N', defaults to rollout batch size when None.
+    over_sampling_batch_size: Optional[int] = None
+    # Custom buffer filter path; None means FIFO.
+    buffer_filter_path: Optional[str] = None
+
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
 

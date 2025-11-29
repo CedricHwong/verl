@@ -63,6 +63,7 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.partial_buffer import PartialBuffer
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
     AsyncRolloutRequestStateEnum,
@@ -312,6 +313,9 @@ class SGLangRollout(BaseRollout):
                 self.pad_token_id = self.processing_class.tokenizer.pad_token_id
             except AttributeError as e:
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
+
+        # Partial rollout buffer (APRIL-style recycle)
+        self._partial_buffer = PartialBuffer(self.config.buffer_filter_path)
 
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
@@ -594,6 +598,9 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        if self.config.partial_rollout:
+            # Use request-level pipeline to enable partial abort/recycle even for single-turn.
+            return self._req_level_generate_sequences(prompts, **kwargs)
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
@@ -1117,10 +1124,47 @@ class SGLangRollout(BaseRollout):
         is_validate = prompts.meta_info.get("validate", False)
         tgt_device = prompts.batch["input_ids"].device
 
+        target_batch_size = len(prompts.batch)
+        over_sampling_batch_size = (
+            self.config.over_sampling_batch_size
+            if self.config.over_sampling_batch_size is not None
+            else target_batch_size
+        )
+
         if self._tp_rank == 0:
-            req_list = self._preprocess_prompt_to_async_rollout_requests(
-                prompts,
-            )
+            req_list = []
+            current_batch_ids = set()
+
+            # Reuse partial requests from buffer first
+            if self.config.partial_rollout:
+                num_from_buffer = min(len(self._partial_buffer), over_sampling_batch_size)
+                if num_from_buffer > 0:
+                    req_list.extend(self._partial_buffer.get_samples(num_from_buffer))
+
+            # Remaining prompts to reach target batch size
+            remaining_needed = max(target_batch_size - len(req_list), 0)
+            if remaining_needed > 0:
+                current_prompts = prompts[:remaining_needed]
+                new_reqs = self._preprocess_prompt_to_async_rollout_requests(current_prompts)
+                req_list.extend(new_reqs)
+                current_batch_ids.update({r.batch_data_id for r in new_reqs})
+
+            # If there are extra prompts beyond target (because we reused partials),
+            # push them into buffer as pending to process later.
+            extra_start = remaining_needed
+            if self.config.partial_rollout and extra_start < target_batch_size:
+                extra_prompts = prompts[extra_start:]
+                if len(extra_prompts) > 0:
+                    extra_reqs = self._preprocess_prompt_to_async_rollout_requests(extra_prompts)
+                    self._partial_buffer.add_samples(extra_reqs)
+
+            # Cap total requests to oversampling budget
+            if len(req_list) > over_sampling_batch_size:
+                # keep newer requests, push overflow back to buffer
+                overflow = req_list[over_sampling_batch_size:]
+                req_list = req_list[:over_sampling_batch_size]
+                if self.config.partial_rollout:
+                    self._partial_buffer.add_samples(overflow)
 
             # distinguish training and validation
             if is_validate:
@@ -1135,6 +1179,8 @@ class SGLangRollout(BaseRollout):
                 # add progress monitoring and abort function
                 total_requests = len(req_list)
                 target_completion = int(total_requests * (1 - self.config.get("over_sample_rate", 0.0)))
+                # Ensure we still aim to produce the full batch for training.
+                target_completion = max(target_completion, target_batch_size, 1)
                 # abort when target_completion of requests are completed
 
                 completed_count = 0
@@ -1146,7 +1192,9 @@ class SGLangRollout(BaseRollout):
                         result = await self._async_rollout_a_request(req, do_sample, is_validate, **kwargs)
                         return result
                     except asyncio.CancelledError:
-                        # request is cancelled, return padding
+                        # request is cancelled, return padding and recycle partial
+                        if self.config.partial_rollout:
+                            self._partial_buffer.add_samples([req])
                         logger.info(f"Request {req.request_id} was cancelled, creating padding")
                         aborted_requests.append(req.request_id)
                         return self._create_padding_request(req)
@@ -1166,7 +1214,10 @@ class SGLangRollout(BaseRollout):
                             if completed_count >= target_completion:
                                 break
                     finally:
-                        # Cancel remaining tasks
+                        if self.config.partial_rollout:
+                            # Abort running requests to collect partials
+                            await self._engine.abort_request(abort_all=True)
+                        # Cancel remaining tasks to unblock gather
                         for t in all_tasks:
                             if not t.done():
                                 t.cancel()
@@ -1174,12 +1225,13 @@ class SGLangRollout(BaseRollout):
                         # Wait for all tasks to finish (including cancelled ones)
                         final_results = await asyncio.gather(*all_tasks, return_exceptions=True)
                         # Abort all requests in SGLang engine
-                        await self._engine.abort_request(abort_all=True)
                     return final_results
 
                 loop = asyncio.get_event_loop()
                 output_req_list = loop.run_until_complete(run_with_cancellation())
 
+            # filter out exceptions
+            output_req_list = [r for r in output_req_list if isinstance(r, AsyncRolloutRequest)]
             sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
         else:
             sorted_output_req_list = None
@@ -1198,6 +1250,17 @@ class SGLangRollout(BaseRollout):
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+
+        # Prefer current batch requests; fill with partials if needed
+        if self.config.partial_rollout and self._tp_rank == 0:
+            current_outputs = [r for r in sorted_output_req_list if r.batch_data_id in current_batch_ids]
+            other_outputs = [r for r in sorted_output_req_list if r.batch_data_id not in current_batch_ids]
+            if len(current_outputs) < target_batch_size:
+                deficit = target_batch_size - len(current_outputs)
+                current_outputs.extend(other_outputs[:deficit])
+            sorted_output_req_list = current_outputs[:target_batch_size]
+        else:
+            sorted_output_req_list = sorted_output_req_list[:target_batch_size]
         # Construct the batch data
         prompt_ids, response_ids = [], []
         prompt_attention_mask, response_attention_mask = [], []
